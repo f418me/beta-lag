@@ -1,0 +1,28 @@
+# Research assumptions, not validated trading parameters.
+strategy_version = "support-break-v1"
+# Live mode always enables the market-session gate; replay uses its recorded settings.
+require_market_session = false
+live_price_sample_seconds = 1.0
+checkpoint_seconds = 30
+status_seconds = 30
+return_window_seconds = 900
+price_max_age_seconds = 90
+equity_threshold = -0.01
+btc_threshold = -0.002
+support_window_seconds = 60
+support_break_fraction = 0.0005
+setup_timeout_seconds = 300
+cooldown_seconds = 900
+metrics_max_age_seconds = 300
+# Binance publishes five-minute samples; allow publication delay without refreshing timestamps.
+long_share_max_age_seconds = 600
+oi_history_seconds = 86400
+oi_min_samples = 20
+oi_percentile = 0.90
+long_share_threshold = 0.55
+# Illustrative assumptions; verify actual fees before real-data evaluation.
+fee_bps_per_side = 5
+slippage_bps_per_side = 2
+stop_loss_fraction = 0.005
+take_profit_fraction = 0.01
+max_holding_seconds = 1800
