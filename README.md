@@ -159,6 +159,20 @@ During collection, inspect the latest heartbeat without opening the writer datab
 uv run beta-lag status
 ```
 
+Live paper sessions started with the exit comparison record three portfolios under
+`exit_comparison` in `beta-lag status` and in the completed session's `report`.
+`control` uses the configured target and holding time (defaults 1% and 30
+minutes). `target_1pct_60m` and `target_2pct_60m` both allow 60 minutes.
+All three receive the same confirmations and use the configured stop, fees,
+slippage and next observed BTC price for fills. Each can hold one position.
+Compare skipped signals and closed trade counts alongside mean net return.
+The mean uses closed trades, excludes funding and is null until the first exit.
+
+Each new session starts all three portfolios together. Its manifest records
+the exit rules. Checkpoints store the trades and skipped signal IDs for each
+variant in DuckDB's `paper_exit_snapshots` table, keyed by run ID and variant.
+The existing Slack trade alerts follow the control portfolio.
+
 The heartbeat includes observed raw/accepted price cadence and strategy filter
 blockers. See [feed diagnostics](docs/operations.md#feed-and-strategy-diagnostics).
 For an exploratory comparison of 15/30/60-minute holds and warning stability,

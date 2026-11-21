@@ -10,7 +10,7 @@ import duckdb
 from beta_lag.config import Settings
 from beta_lag.engine import Engine
 from beta_lag.models import Event
-from beta_lag.paper import PaperBroker
+from beta_lag.paper import PaperBroker, exit_comparison
 
 
 def json_value(value: object) -> str:
@@ -46,6 +46,10 @@ class Store:
                 entry_price DOUBLE, exit_price DOUBLE, exit_reason VARCHAR,
                 net_return_ex_funding DOUBLE, data_gap BOOLEAN
             );
+            CREATE TABLE IF NOT EXISTS paper_exit_snapshots (
+                run_id VARCHAR, variant VARCHAR, trade_details JSON, skipped_signals JSON,
+                PRIMARY KEY(run_id, variant)
+            );
             CREATE TABLE IF NOT EXISTS excursions (
                 run_id VARCHAR, signal_id BIGINT, horizon_minutes INTEGER,
                 mfe DOUBLE, mae DOUBLE, status VARCHAR
@@ -68,7 +72,15 @@ class Store:
             [self.run_id, sequence, event.timestamp, event.kind, event.model_dump_json()],
         )
 
-    def finish(self, engine: Engine, broker: PaperBroker, count: int, status="completed") -> dict:
+    def finish(
+        self,
+        engine: Engine,
+        broker: PaperBroker,
+        count: int,
+        status="completed",
+        *,
+        exit_books=None,
+    ) -> dict:
         for index, item in enumerate(engine.transitions):
             self.connection.execute(
                 "INSERT INTO transitions VALUES (?, ?, ?, ?, ?, ?)",
@@ -106,24 +118,23 @@ class Store:
                         evaluation.status,
                     ],
                 )
-        closed = [t for t in broker.trades if t.exit_at is not None]
         summary = {
             "status": status,
             "run_id": self.run_id,
             "events": count,
             "signals": len(engine.signals),
-            "trades": len(broker.trades),
-            "closed_trades": len(closed),
-            "open_trades": len(broker.trades) - len(closed),
-            "trades_with_data_gaps": sum(t.data_gap for t in broker.trades),
-            "pending_signal": broker.pending.id if broker.pending else None,
+            **broker.outcome_summary(),
             "skipped_signals": broker.skipped,
-            "mean_net_return_ex_funding": (
-                sum(t.net_return_ex_funding for t in closed) / len(closed) if closed else None
-            ),
             "funding_included": False,
             "final_state": engine.state.value,
         }
+        if exit_books:
+            summary["exit_comparison"] = exit_comparison(exit_books)
+            for name, book in exit_books.items():
+                self.connection.execute(
+                    "INSERT OR REPLACE INTO paper_exit_snapshots VALUES (?, ?, ?, ?)",
+                    [self.run_id, name, json_value(book.snapshot()), json_value(book.skipped)],
+                )
         self.connection.execute(
             "UPDATE runs SET summary = ? WHERE run_id = ?", [json_value(summary), self.run_id]
         )
@@ -131,7 +142,9 @@ class Store:
         self.transaction_active = False
         return summary
 
-    def checkpoint(self, config, batch, engine, broker, count, status="running") -> dict:
+    def checkpoint(
+        self, config, batch, engine, broker, count, status="running", *, exit_books=None
+    ) -> dict:
         """Atomically commit new inputs and replace the current research snapshot."""
         try:
             exists = self.connection.execute(
@@ -146,7 +159,7 @@ class Store:
                 self.append(sequence, event)
             for table in ("transitions", "signals", "trades", "excursions"):
                 self.connection.execute(f"DELETE FROM {table} WHERE run_id = ?", [self.run_id])
-            result = self.finish(engine, broker, count, status)
+            result = self.finish(engine, broker, count, status, exit_books=exit_books)
             self.connection.execute("CHECKPOINT")
             return result
         except BaseException:

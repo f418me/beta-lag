@@ -1,5 +1,6 @@
 """Single-position short simulator using observed prices, not hindsight fills."""
 
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 
@@ -109,5 +110,31 @@ class PaperBroker:
                 )
                 self.pending = None
 
+    def outcome_summary(self) -> dict:
+        closed = [trade for trade in self.trades if trade.exit_at is not None]
+        returns = [trade.net_return_ex_funding for trade in closed]
+        return {
+            "trades": len(self.trades),
+            "closed_trades": len(closed),
+            "open_trades": len(self.trades) - len(closed),
+            "pending_signal": self.pending.id if self.pending else None,
+            "trades_with_data_gaps": sum(trade.data_gap for trade in self.trades),
+            "wins": sum(value > 0 for value in returns),
+            "exit_reasons": dict(Counter(trade.exit_reason for trade in closed)),
+            "mean_net_return_ex_funding": sum(returns) / len(returns) if returns else None,
+        }
+
     def snapshot(self) -> list[dict]:
         return [asdict(trade) for trade in self.trades]
+
+
+def exit_comparison(books: dict[str, PaperBroker]) -> dict:
+    return {
+        name: {
+            "take_profit_fraction": book.config.take_profit_fraction,
+            "max_holding_seconds": book.config.max_holding_seconds,
+            "skipped_count": len(book.skipped),
+            **book.outcome_summary(),
+        }
+        for name, book in books.items()
+    }

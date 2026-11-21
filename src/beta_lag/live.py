@@ -20,7 +20,7 @@ from beta_lag.engine import Engine
 from beta_lag.market_session import CALENDAR_URL, NEW_YORK, parse_calendar
 from beta_lag.models import Clock, MarketSession, Metrics, Price
 from beta_lag.notifications import SlackNotifications
-from beta_lag.paper import PaperBroker
+from beta_lag.paper import PaperBroker, exit_comparison
 from beta_lag.replay import write_call
 from beta_lag.runtime import process_event
 from beta_lag.status import write_json
@@ -102,6 +102,18 @@ class Collector:
         self.last_observed: dict[str, datetime] = {}
         self.engine = Engine(config)
         self.broker = PaperBroker(config)
+        self.exit_alternatives = {
+            name: PaperBroker(
+                config.model_copy(
+                    update={
+                        "take_profit_fraction": target,
+                        "max_holding_seconds": 3600,
+                    }
+                )
+            )
+            for name, target in (("target_1pct_60m", 0.01), ("target_2pct_60m", 0.02))
+        }
+        self.exit_books = {"control": self.broker, **self.exit_alternatives}
         self.current_oi: dict | None = None
         self.current_accounts: dict | None = None
         self.last_metrics_oi: datetime | None = None
@@ -203,6 +215,7 @@ class Collector:
                 else None
             ),
             "session": self.engine.session.model_dump(mode="json") if self.engine.session else None,
+            "exit_comparison": exit_comparison(self.exit_books),
             "open_paper_trades": sum(t.exit_at is None for t in self.broker.trades),
             "notifications": self.notifications.snapshot(),
         }
@@ -451,6 +464,7 @@ class Collector:
                         self.broker,
                         self.counters["events"],
                         state,
+                        exit_books=self.exit_books,
                     )
                     self.checkpoint_at = utc_now().isoformat()
 
@@ -492,7 +506,9 @@ class Collector:
                             observations.write(json.dumps(row, default=str, allow_nan=False) + "\n")
                         if event is not None:
                             events.write(event.model_dump_json() + "\n")
-                            process_event(self.engine, self.broker, event)
+                            process_event(
+                                self.engine, self.broker, event, *self.exit_alternatives.values()
+                            )
                             self.notifications.observe(self.engine, self.broker)
                             batch.append((self.counters["events"], event))
                             if isinstance(event, Price):
@@ -535,7 +551,15 @@ async def collect_live(seconds: int, output: Path, config: Settings) -> dict:
     config = config.model_copy(update={"require_market_session": True})
     folder = output / f"{utc_now():%Y%m%dT%H%M%SZ}-{uuid4().hex[:8]}"
     folder.mkdir(parents=True, exist_ok=False)
+    collector = Collector(config)
     manifest = {
+        "paper_exit_rules": {
+            name: {
+                "take_profit_fraction": book.config.take_profit_fraction,
+                "max_holding_seconds": book.config.max_holding_seconds,
+            }
+            for name, book in collector.exit_books.items()
+        },
         "started_at": utc_now().isoformat(),
         "seconds_requested": seconds,
         "mode": "forward_only_collection",
@@ -551,7 +575,6 @@ async def collect_live(seconds: int, output: Path, config: Settings) -> dict:
         "oi_timestamp_basis": "local_receipt_provider_timestamp_unavailable",
     }
     (folder / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    collector = Collector(config)
     interrupted = False
     try:
         async with aiohttp.ClientSession(
