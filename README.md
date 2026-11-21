@@ -18,6 +18,12 @@ Live inputs now reach the complete paper-trading state machine after warm-up. Co
 - [Replay format and implemented rules](docs/replay.md): input contract, timing, and simulation details.
 - [System design specification](software_design_document_cross_asset_crypto_warning_system.md): the current architecture, trading hypothesis, implemented behavior, limitations, and operational acceptance criteria.
 
+Latest engineering review (2026-11-18): feed/strategy diagnostics and offline
+parameter comparisons are implemented; live trading rules remain unchanged.
+The independent BTC probe observed roughly 12.4-second updates. The baseline has
+only two completed paper trades, so no profitability conclusion or parameter
+change is justified. See the [dated findings](docs/replay.md#findings-from-the-2026-11-18-snapshot).
+
 ## Quick start
 
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then run from the repository root:
@@ -61,13 +67,13 @@ To check release packaging:
 uv build
 ```
 
-The `uv_build` backend creates an installable wheel (`.whl`) and a source archive (`.tar.gz`) in the ignored `dist/` directory. The build verifies packaging; it does not replace tests, publish to PyPI, or create a Docker image or standalone executable. Building these artifacts is optional for the documented checkout-based NUC deployment. Python 3.12 or newer and the runtime dependencies are still required.
+The `uv_build` backend creates an installable wheel (`.whl`) and a source archive (`.tar.gz`) in the `dist/` directory. The build verifies packaging; it does not replace tests, publish to PyPI, or create a Docker image or standalone executable. Building these artifacts is optional for the documented checkout-based NUC deployment. Python 3.12 or newer and the runtime dependencies are still required.
 
 ## Local API credentials
 
 Use [.env.example](.env.example) as the template for a local `.env`. Set `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY` to your Alpaca paper-account credentials, and `COINGLASS_API_KEY` to your CoinGlass API key. Hyperliquid and Binance public market data require no credentials. No Binance account or API key is needed. Existing local credentials are not overwritten by any command.
 
-Git ignores `.env`; only the empty example belongs in version control. The current demo and replay do not read credentials or require API access. To load the local credentials and perform a bounded read-only provider check:
+Keep `.env` out of version control; only the empty example belongs there. The current demo and replay do not read credentials or require API access. To load the local credentials and perform a bounded read-only provider check:
 
 ```sh
 uv run --env-file .env beta-lag check-providers --output data/provider-check.json
@@ -76,6 +82,30 @@ uv run --env-file .env beta-lag check-providers --output data/provider-check.jso
 This checks Alpaca IEX latest trades for QQQ/SOXX, the Hyperliquid mainnet BTC order book, the current CoinGlass OI exchange-list snapshot, and the latest Binance account-long-share sample. It does not download historical series. The output flags stale ETF observations and reports the Binance sample age independently from provider access. It contains selected market data and status codes, never credentials or raw provider error messages. The optional output file is replaced on each invocation.
 
 The connection check is not a streaming strategy run. In particular, successful API access does not mean all inputs required for trade confirmation are available.
+
+## Slack notifications
+
+Set `SLACK_WEBHOOK_URL` in the local `.env` to an [Incoming Webhook](https://docs.slack.dev/messaging/sending-messages-using-incoming-webhooks/) for your chosen Slack channel. The URL is a secret; keep it out of Git, TOML settings, and chat messages. An empty value disables notifications. The webhook selects the destination channel; no bot token or additional Python dependency is required.
+
+Send one explicit test message without starting market-data collection:
+
+```sh
+uv run --env-file .env beta-lag check-slack
+```
+
+Live runs send these English-language messages, labeled `PAPER` and identified by run and UTC time:
+
+- **Collector started:** after the initial database checkpoint. This does not claim provider access or warm-up is complete.
+- **WARNING / ARMED:** a new equity-divergence setup and a passed derivatives filter, respectively. Neither is an entry.
+- **CONFIRMED:** a BTC support-break signal, including the triggering ETF return, BTC reference/support, OI rank, and long-account share.
+- **Paper short opened / closed:** the actual simulated fill or exit, with prices, exit reason, and return after fees/slippage but excluding funding.
+- **Setup cancelled / paper entry skipped:** the setup expired or was invalidated, or the broker could not open the simulated position.
+
+Demo and replay never send notifications. Signal rules and simulated execution are unchanged. No exchange orders are submitted.
+
+Delivery uses a separate bounded queue, five-second HTTP timeouts, and up to three attempts for network errors, HTTP 5xx responses, or rate limits. Requests are spaced by at least one second and respect Slack's `Retry-After` header. Slack delivery never blocks market-event processing. Shutdown allows up to ten seconds to finish queued messages; remaining messages are dropped. Status and final summaries expose notification `sent`, `failed`, `dropped`, `pending`, and sanitized `last_error` fields, without the webhook URL or raw response bodies.
+
+Notifications are best effort: the queue is in memory, and signals can be announced before the next periodic database checkpoint. Crashes can lose pending messages, and retries after an ambiguous network failure can duplicate a message. Run and signal identifiers help identify duplicates. This is not an external heartbeat monitor or a provider-outage alert service.
 
 ## Collect live data from now on
 
@@ -128,6 +158,18 @@ During collection, inspect the latest heartbeat without opening the writer datab
 ```sh
 uv run beta-lag status
 ```
+
+The heartbeat includes observed raw/accepted price cadence and strategy filter
+blockers. See [feed diagnostics](docs/operations.md#feed-and-strategy-diagnostics).
+For an exploratory comparison of 15/30/60-minute holds and warning stability,
+without changing the live strategy:
+
+```sh
+uv run python -m beta_lag.research data/live/SESSION --output data/research/comparison.json
+```
+
+This fixed-grid, in-sample report is not validation or automatic parameter tuning.
+See [comparison semantics and limits](docs/replay.md#exploratory-parameter-comparison).
 
 New setups and pending entries are blocked outside the regular US session or when its calendar is unknown. Existing paper positions still exit using BTC prices. Live mode always records `require_market_session=true`. Checkpoints preserve previous commits after an error; the latest uncommitted interval may need recovery from the journal. Restarting creates a fresh research run and does not automatically resume old paper positions. See [operations and recovery](docs/operations.md) for NUC setup, backup limits, and capacity estimates.
 

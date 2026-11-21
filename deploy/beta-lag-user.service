@@ -1,0 +1,21 @@
+[Unit]
+Description=Beta-lag continuous paper research collector
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/fre/beta-lag
+EnvironmentFile=/home/fre/beta-lag/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/fre/beta-lag/.venv/bin/beta-lag live --seconds 0 --output /home/fre/beta-lag/data/live --config /home/fre/beta-lag/config.example.toml
+Restart=on-failure
+RestartSec=15
+KillSignal=SIGINT
+TimeoutStopSec=60
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

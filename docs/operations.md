@@ -19,6 +19,8 @@ Use `--output /path/to/live-root` to inspect another directory, or point directl
 
 Status is atomically replaced every 30 seconds and at shutdown; concise JSON status records also go to stderr for service logging. `status_seconds` is configurable. A five-second clock drives quiet-period updates, so checkpoint/status intervals have up to approximately five seconds of scheduling granularity, plus processing time.
 
+Optional Slack notifications use `SLACK_WEBHOOK_URL` from the environment. The service reads it from the same `/opt/beta-lag/.env` as the provider credentials; restart the service after changing it. See the [Slack setup and message list](../README.md#slack-notifications). A startup notification confirms collector initialization, not provider readiness. `status.json` includes delivery counters and sanitized errors. Slack failures do not stop collection. Delivery drains for at most ten seconds during graceful shutdown; undelivered messages are not restored after a restart. An external monitor is still needed to detect a dead process or stale heartbeat.
+
 ## Regular-session gate
 
 Live mode always enables `require_market_session`, regardless of the example TOML value used for offline demos. The effective settings are recorded in both the manifest and database.
@@ -74,6 +76,29 @@ df -h /var/lib/beta-lag
 
 Use a service-log retention limit appropriate for the host. Keep system time synchronized; future observations are rejected and backward clock jumps stop the run.
 
+## Existing NUC user service
+
+The local checkout also supplies `deploy/beta-lag-user.service`, using
+`/home/fre/beta-lag/.venv/bin/beta-lag` and writing under `data/live`.
+This is a user service, separate from the `/opt` system-service example above:
+
+```sh
+systemctl --user status beta-lag-user.service
+journalctl --user -u beta-lag-user.service -n 50 --no-pager
+```
+
+After changing the installed unit, run `systemctl --user daemon-reload`.
+After code/environment changes, a controlled
+`systemctl --user restart beta-lag-user.service` loads them. Check `beta-lag status`
+first: restarting does not restore open paper trades and resets warm-up.
+Use one collector per Alpaca credential set/feed: concurrent local/manual
+collectors can exhaust the provider's connection allowance. A process being
+`active` alone does not confirm provider health; check the heartbeat as well.
+
+The diagnostics release was activated on 2026-11-18 at 18:17 Swiss time after
+checking there were no active setups or open trades. All providers connected in
+the new run. Existing journals remain available for historical research.
+
 ## Data volume
 
 Default collection retains at most one price per second for each symbol. BTC is collected around the clock; QQQ/SOXX only during the regular session. Full L2 order-book messages are consumed from the network but are not written to disk. Their midpoint is stored. Sampling can miss intrasecond extrema and is explicitly a research-resolution choice; `live_price_sample_seconds` controls it.
@@ -115,3 +140,41 @@ Allow roughly **USD 12–15/month** as a planning budget before taxes and market
 Use a persistent volume mounted at the chosen `--output` path. The Machine root filesystem is ephemeral. Volumes are local to a Machine/region and are not automatically replicated; maintain an independent backup. Snapshot storage can add cost. [Fly volume documentation](https://docs.fly.io/volumes/overview)
 
 Test all provider endpoints from the chosen hosting region before moving the collector: public Binance access can depend on the source IP/region. No Fly account, app, paid resource, or deployment has been created here. For an existing always-on NUC, local hosting is the simplest first option; Fly is reasonable if independent hosting and remote operations are more valuable than the additional monthly cost.
+
+## Feed and strategy diagnostics
+
+New live runs include `diagnostics` in each `status.json` heartbeat:
+
+- `price_cadence` distinguishes `raw_received` (local receipt before queueing),
+  `raw_observed` (provider timestamps) and `accepted` (normalized stored prices).
+  Each series has lifetime observation/gap counts and median/p95/max over its
+  latest 512 positive intervals. Duplicate/backward timestamps do not refresh
+  the interval baseline. Gap counts use `price_max_age_seconds`.
+- `configured_minimum_price_interval_seconds` is a sampling floor, not a promise
+  of one provider observation per second. `queue_size` helps detect backpressure.
+- `strategy` records warning/arming/confirmation totals, cancellation reasons,
+  checks and blockers at metrics events during WARNING, the last check and current
+  setup wait reason. A check can fail several filters; counts are checks, not
+  distinct setups. Support is only evaluated after freshness and OI warm-up pass.
+  The last check is historical; its timestamp may precede the current setup.
+
+For a bounded, public Hyperliquid test independent of the collector:
+
+```sh
+uv run python scripts/probe_btc_feed.py --seconds 40
+```
+
+It opens only a BTC order-book WebSocket, never Alpaca, and sends no notifications
+or orders. It prints timing statistics without saving credentials or payloads.
+A test on 2026-11-18 received four BTC book messages in 40 seconds with about
+12.4 seconds between observations/receipts, consistent with the stored journal.
+This isolates that observation from strategy/database processing but does not
+identify whether the remote server or transport causes the low rate. Hyperliquid
+[documents](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions)
+its book as a snapshot feed pushed on eligible blocks at least 0.5 seconds apart;
+that is not a guaranteed delivery interval. No source or price semantics have
+been changed. Do not manufacture faster prices by repeating old observations.
+
+New diagnostics require a process restart. Restarts still start a fresh warm-up
+and do not resume open paper trades. Historical comparisons can use old journals
+without restarting the collector.

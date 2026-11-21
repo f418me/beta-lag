@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import json
+import os
 from pathlib import Path
 
 import duckdb
@@ -36,6 +37,7 @@ def main() -> None:
         "check-providers", help="Read-only API access and market data check"
     )
     probe.add_argument("--output", type=Path)
+    commands.add_parser("check-slack", help="Send a test message to the configured Slack webhook")
     live = commands.add_parser("live", help="Collect new market data only; no historical downloads")
     live.add_argument("--seconds", type=int, default=60)
     live.add_argument("--output", type=Path, default=Path("data/live"))
@@ -46,6 +48,14 @@ def main() -> None:
     status.add_argument("--output", type=Path, default=Path("data/live"))
     args = parser.parse_args()
     try:
+        if args.command == "check-slack":
+            from beta_lag.notifications import check_slack
+
+            result = asyncio.run(check_slack(os.getenv("SLACK_WEBHOOK_URL")))
+            print(json.dumps(result, indent=2))
+            if result["sent"] != 1:
+                parser.exit(1)
+            return
         if args.command == "status":
             from beta_lag.status import read_status
 

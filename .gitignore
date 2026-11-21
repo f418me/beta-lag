@@ -13,3 +13,8 @@ data/
 *.duckdb
 *.duckdb.wal
 .DS_Store
+
+# Alternate local environments and generated output
+.venv-linux/
+build/
+*.log

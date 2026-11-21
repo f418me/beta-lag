@@ -1,8 +1,8 @@
 # System design: cross-asset crypto early warning
 
-**Version:** 2.0
+**Version:** 2.1
 
-**Updated:** 2026-11-08
+**Updated:** 2026-11-18
 
 **Status:** Implemented research MVP; operational validation remains open.
 
@@ -24,11 +24,14 @@ The objective is reproducible forward testing with simulated trades and stated c
 - Normalized event journals, deterministic replay, and a four-state signal engine.
 - A local paper broker for one short position at a time.
 - DuckDB research records, periodic live checkpoints, status reporting, and sampled excursion analysis.
-- A sample systemd service for a Linux NUC.
+- Optional Slack notifications for startup, setup changes, confirmed signals, and paper entry/exit outcomes.
+- System and user systemd service examples for a Linux NUC, both using `.venv`.
+- Bounded raw/accepted price-cadence diagnostics and strategy filter/cancellation counters.
+- An offline fixed-grid comparison of holding limits and warning stability.
 
 No historical market series are downloaded and interruptions are not backfilled. Rolling windows contain observations collected during the current run. Replay reads locally recorded or synthetic events.
 
-Exchange execution, testnet orders, wallets, Spot-CVD, liquidation feeds, funding costs, and automatic state restoration are not implemented. There is no automatic notification service or web dashboard.
+Exchange execution, testnet orders, wallets, Spot-CVD, liquidation feeds, funding costs, and automatic state restoration are not implemented. There is no external health-monitoring service or web dashboard.
 
 ## 3. Runtime and data flow
 
@@ -48,7 +51,7 @@ Provider tasks feed a bounded asynchronous queue. A single consumer processes ac
 | Binance public REST | Latest BTCUSDT account ratio, `period=5m&limit=1`, polled every 30 seconds | `longAccount` measures Binance account share, not market-wide exposure or taker flow. |
 | Alpaca calendar | Today's regular US session, every five minutes | Includes holidays and early closes, not unscheduled trading halts. |
 
-Alpaca and CoinGlass require credentials. Public Hyperliquid and Binance data do not. Credentials come from the environment; `.env` is ignored and `.env.example` contains empty placeholders.
+Alpaca and CoinGlass require credentials. Public Hyperliquid and Binance data do not. Credentials come from the environment. Keep `.env` excluded from version control; `.env.example` contains empty placeholders.
 
 The composite metrics series is `coinglass:BTC:All:quantity|binance:BTCUSDT:global-account-share:5m`. CoinGlass OI uses receipt time with `oi_time_basis="receipt"`; a successful poll cannot prove the underlying data is fresh. Binance keeps its original sample timestamp. Polling the same ratio again cannot refresh its age. A usable account sample may accompany multiple new OI snapshots, but each OI snapshot contributes at most one metrics event.
 
@@ -116,13 +119,31 @@ The initial deployment target is one collector process on an always-on Linux NUC
 
 The `status` command reads status files without opening the active database. Status includes provider states, freshness, warm-up, counts, checkpoint time, and open paper trades; it reports stale heartbeats. Structured status also goes to stderr.
 
-WebSocket disconnections trigger exponential reconnect backoff. Authentication or subscription rejection can stop an individual provider task while the process stays alive. A running service therefore does not prove collection health. Missing or stale inputs suppress strategy readiness. Automatic alerts, disk-space alarms, and retention remain operational work. Provider failure handling will be assessed during supervised real operation; additional simulated provider-failure tests are not required for the initial deployment.
+An optional `SLACK_WEBHOOK_URL` enables live startup, warning, armed, confirmed, cancellation, and paper-trade outcome messages. Demo/replay remain offline. A separate bounded worker sends messages with timeouts, rate-limit handling, and bounded retries; the market-data consumer only enqueues messages. Notification delivery counts and sanitized errors appear in status and final summaries. The secret URL is never stored in research settings or artifacts. Delivery is best effort, with an in-memory queue, no transactional outbox, and a ten-second shutdown drain. A retry after an ambiguous response can duplicate a notification. Slack notifications do not authorize or execute exchange orders.
+
+WebSocket disconnections trigger exponential reconnect backoff. Authentication or subscription rejection can stop an individual provider task while the process stays alive. A running service therefore does not prove collection health. Missing or stale inputs suppress strategy readiness. Provider-health and stale-heartbeat alerts, disk-space alarms, and retention remain operational work. Provider failure handling will be assessed during supervised real operation; additional simulated provider-failure tests are not required for the initial deployment.
 
 Storage grows with event cadence and recording duration. The supplied synthetic estimator supports capacity planning, not a claim of measured monthly usage. Journals and DuckDB deliberately duplicate useful data. Backups and retention need separate capacity. Deployment and sizing details are maintained in the operations guide.
 
+Price sampling is an upper storage-rate limit, not a guaranteed feed frequency.
+Status diagnostics distinguish raw receipt times, provider timestamps and accepted
+prices over a bounded interval history. A public, independent probe on 2026-11-18
+observed approximately 12.4 seconds between BTC book updates. This reproduces the
+journal's coarse resolution without strategy/database processing, but does not
+identify server versus transport causation. No provider or price semantics were
+changed. See [feed diagnostics](docs/operations.md#feed-and-strategy-diagnostics).
+
+Offline comparisons use the session manifest and a fixed byte snapshot of its
+journal, preserving causal next-observation fills and unfinished positions. They
+combine 15/30/60-minute holds with original warnings, 15-second observed
+persistence or an equity release threshold relaxed to 80% of the entry threshold.
+These constructor options are not live configuration fields. The live defaults
+remain unchanged. Results are exploratory in-sample measurements, not a validated
+parameter selection. See [comparison rules](docs/replay.md#exploratory-parameter-comparison).
+
 ## 10. Verification and remaining acceptance criteria
 
-Tests cover strategy timing, validation and replay, paper execution, provider parsing, sessions, status, and checkpoints, including abrupt termination after a committed checkpoint. Synthetic demos verify pipeline behavior, not profitability. Short provider probes and live smoke tests do not replace observing a complete market session.
+Tests cover strategy timing, validation and replay, paper execution, provider parsing, sessions, status, and checkpoints, including abrupt termination after a committed checkpoint. Tests also cover bounded cadence telemetry, failed-filter reporting, warning persistence/recovery, hysteresis and unfinished offline trades. On 2026-11-18, all 84 tests and both Ruff checks passed. Synthetic demos verify pipeline behavior, not profitability. Short provider probes and live smoke tests do not replace observing a complete market session.
 
 Before the initial code commit:
 

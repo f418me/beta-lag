@@ -15,9 +15,11 @@ import aiohttp
 
 from beta_lag.binance import BINANCE_PARAMS, BINANCE_RATIO, account_snapshot
 from beta_lag.config import Settings
+from beta_lag.diagnostics import PriceCadence, strategy_diagnostics
 from beta_lag.engine import Engine
 from beta_lag.market_session import CALENDAR_URL, NEW_YORK, parse_calendar
 from beta_lag.models import Clock, MarketSession, Metrics, Price
+from beta_lag.notifications import SlackNotifications
 from beta_lag.paper import PaperBroker
 from beta_lag.replay import write_call
 from beta_lag.runtime import process_event
@@ -95,6 +97,7 @@ class Collector:
         self.config = config
         self.queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=4096)
         self.counters: Counter = Counter()
+        self.price_cadence = PriceCadence()
         self.provider_status: dict[str, str] = {}
         self.last_observed: dict[str, datetime] = {}
         self.engine = Engine(config)
@@ -104,6 +107,7 @@ class Collector:
         self.last_metrics_oi: datetime | None = None
         self.research: dict | None = None
         self.checkpoint_at: str | None = None
+        self.notifications = SlackNotifications(os.getenv("SLACK_WEBHOOK_URL"))
 
     def combined_metrics(self, now: datetime) -> Metrics | None:
         if self.current_oi is None or self.current_accounts is None:
@@ -185,6 +189,13 @@ class Collector:
             "providers": dict(self.provider_status),
             "counts": dict(self.counters),
             "readiness": self.readiness(),
+            "diagnostics": {
+                "price_cadence": self.price_cadence.snapshot(utc_now()),
+                "cadence_window_intervals": 512,
+                "configured_minimum_price_interval_seconds": self.config.live_price_sample_seconds,
+                "queue_size": self.queue.qsize(),
+                "strategy": strategy_diagnostics(self.engine),
+            },
             "last_checkpoint_at": self.checkpoint_at,
             "last_transition": (
                 self.engine.transitions[-1].model_dump(mode="json")
@@ -193,6 +204,7 @@ class Collector:
             ),
             "session": self.engine.session.model_dump(mode="json") if self.engine.session else None,
             "open_paper_trades": sum(t.exit_at is None for t in self.broker.trades),
+            "notifications": self.notifications.snapshot(),
         }
 
     async def poll_calendar(self, session: aiohttp.ClientSession) -> None:
@@ -281,6 +293,16 @@ class Collector:
                                 alpaca_prices(payload) if alpaca else hyperliquid_prices(payload)
                             )
                             for price in prices:
+                                for stage, stamp in (
+                                    ("raw_received", utc_now()),
+                                    ("raw_observed", price["observed_at"]),
+                                ):
+                                    self.price_cadence.observe(
+                                        price["symbol"],
+                                        stage,
+                                        stamp,
+                                        self.config.price_max_age_seconds,
+                                    )
                                 await self.emit("price", provider=provider, **price)
                             if prices:
                                 delay = 1
@@ -433,6 +455,13 @@ class Collector:
                     self.checkpoint_at = utc_now().isoformat()
 
                 await write_call(persist)
+                await self.notifications.start(folder.name)
+                self.notifications.publish(
+                    "Collector started",
+                    f"Strategy: {self.config.strategy_version}. Warm-up pending.\n"
+                    "Collecting new observations; provider readiness is not yet established.\n"
+                    "Paper trading only; exchange orders are disabled.",
+                )
                 await write_call(write_json, folder / "status.json", self.status_snapshot())
                 while True:
                     row = await self.queue.get()
@@ -441,6 +470,7 @@ class Collector:
                             final_state = row.get("status", "completed")
                             await write_call(persist, final_state)
                             batch.clear()
+                            await self.notifications.close()
                             await write_call(
                                 write_json,
                                 folder / "status.json",
@@ -463,8 +493,15 @@ class Collector:
                         if event is not None:
                             events.write(event.model_dump_json() + "\n")
                             process_event(self.engine, self.broker, event)
+                            self.notifications.observe(self.engine, self.broker)
                             batch.append((self.counters["events"], event))
                             if isinstance(event, Price):
+                                self.price_cadence.observe(
+                                    event.symbol,
+                                    "accepted",
+                                    event.observed_at,
+                                    self.config.price_max_age_seconds,
+                                )
                                 self.counters[f"prices_{event.symbol}"] += 1
                             if isinstance(event, Metrics):
                                 self.counters["combined_metrics"] += 1
@@ -486,7 +523,10 @@ class Collector:
                     finally:
                         self.queue.task_done()
         finally:
-            store.close()
+            try:
+                await self.notifications.close()
+            finally:
+                store.close()
 
 
 async def collect_live(seconds: int, output: Path, config: Settings) -> dict:
@@ -569,6 +609,7 @@ async def collect_live(seconds: int, output: Path, config: Settings) -> dict:
         "readiness": collector.readiness(),
         "research": research,
         "orders_submitted": 0,
+        "notifications": collector.notifications.snapshot(),
     }
     (folder / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
     manifest["status"] = "interrupted" if interrupted else "completed"

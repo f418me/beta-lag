@@ -1,6 +1,6 @@
 """Deterministic state machine; inputs are processed in availability order."""
 
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime, timedelta
 
 from beta_lag.config import Settings
@@ -9,7 +9,31 @@ from beta_lag.models import Event, MarketSession, Metrics, Price, Signal, State,
 
 
 class Engine:
-    def __init__(self, settings: Settings):
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        warning_min_seconds: int = 0,
+        equity_release_threshold: float | None = None,
+    ):
+        # Experimental knobs are used by offline research only; live uses these defaults.
+        if warning_min_seconds < 0:
+            raise ValueError("warning_min_seconds must be nonnegative")
+        release = (
+            settings.equity_threshold
+            if equity_release_threshold is None
+            else equity_release_threshold
+        )
+        if not settings.equity_threshold <= release < 0:
+            raise ValueError(
+                "Release threshold must be at least the entry threshold and below zero"
+            )
+        self.warning_min_seconds = warning_min_seconds
+        self.equity_release_threshold = release
+        self.candidate_since: dict[str, datetime] = {}
+        self.filter_checks = 0
+        self.filter_blockers: Counter = Counter()
+        self.last_filter_check: dict | None = None
         self.config = settings
         self.state = State.IDLE
         self.prices: dict[str, deque[Price]] = {s: deque() for s in ("BTC", "QQQ", "SOXX")}
@@ -137,6 +161,7 @@ class Engine:
         if self.state == State.CONFIRMED:
             self.move(State.IDLE, "confirmation_recorded")
         if not self.session_open():
+            self.candidate_since.clear()
             if self.state in (State.WARNING, State.ARMED):
                 self.move(State.IDLE, "market_closed_or_calendar_unavailable")
             return None
@@ -148,7 +173,7 @@ class Engine:
                 self.move(State.IDLE, "stale_market_data")
                 return None
             equity_return = self.price_return(self.trigger)
-            if equity_return is None or equity_return >= self.config.equity_threshold:
+            if equity_return is None or equity_return >= self.equity_release_threshold:
                 self.move(State.IDLE, "equity_stress_resolved")
                 return None
             if self.price_return("BTC") is None:
@@ -162,34 +187,63 @@ class Engine:
 
         if self.state == State.IDLE:
             if self.cooldown_until and self.now < self.cooldown_until:
+                self.candidate_since.clear()
                 return None
             btc_return = self.price_return("BTC")
             if btc_return is None or btc_return <= self.config.btc_threshold:
+                self.candidate_since.clear()
                 return None
             candidates = [(s, self.price_return(s)) for s in ("QQQ", "SOXX")]
             candidates = [(s, r) for s, r in candidates if r is not None]
+            stressed = {
+                symbol for symbol, value in candidates if value < self.config.equity_threshold
+            }
+            self.candidate_since = {
+                symbol: self.candidate_since.get(symbol, self.now) for symbol in stressed
+            }
             if candidates:
                 symbol, value = min(candidates, key=lambda item: item[1])
-                if value < self.config.equity_threshold:
+                if (
+                    value < self.config.equity_threshold
+                    and (self.now - self.candidate_since[symbol]).total_seconds()
+                    >= self.warning_min_seconds
+                ):
                     self.trigger = symbol
                     self.deadline = self.now + timedelta(seconds=self.config.setup_timeout_seconds)
                     self.move(State.WARNING, "equity_shock_and_btc_divergence")
 
         if self.state == State.WARNING and isinstance(event, Metrics):
             fresh = self.metrics_fresh(event)
-            if fresh and len(previous) >= self.config.oi_min_samples:
-                rank = sum(p.open_interest < event.open_interest for p in previous) / len(previous)
-                support = self.find_support()
-                if (
-                    rank > self.config.oi_percentile
-                    and event.open_interest > previous[-1].open_interest
-                    and event.long_share > self.config.long_share_threshold
-                    and support is not None
-                ):
-                    self.armed_metrics = event
-                    self.percentile = rank
-                    self.support = support
-                    self.move(State.ARMED, "elevated_rising_oi_and_long_bias")
+            warm = len(previous) >= self.config.oi_min_samples
+            rank = (
+                sum(p.open_interest < event.open_interest for p in previous) / len(previous)
+                if previous
+                else None
+            )
+            support = self.find_support() if fresh and warm else None
+            checks = {
+                "stale_derivatives": fresh,
+                "oi_warmup": warm,
+                "oi_rank_not_high": rank is not None and rank > self.config.oi_percentile,
+                "oi_not_rising": bool(previous)
+                and event.open_interest > previous[-1].open_interest,
+                "long_share_not_high": event.long_share > self.config.long_share_threshold,
+                "support_unavailable": not (fresh and warm) or support is not None,
+            }
+            blockers = [name for name, passed in checks.items() if not passed]
+            self.filter_checks += 1
+            self.filter_blockers.update(blockers)
+            self.last_filter_check = {
+                "timestamp": self.now.isoformat(),
+                "blockers": blockers,
+                "oi_rank": rank,
+                "long_share": event.long_share,
+            }
+            if not blockers:
+                self.armed_metrics = event
+                self.percentile = rank
+                self.support = support
+                self.move(State.ARMED, "elevated_rising_oi_and_long_bias")
 
         if self.state == State.ARMED:
             assert self.armed_metrics is not None and self.support is not None

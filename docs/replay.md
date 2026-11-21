@@ -97,3 +97,82 @@ Database tables:
 | `excursions` | Per-trade MFE/MAE for each horizon and completion status. |
 
 Every table includes `run_id`. `uv run beta-lag report` prints stored run summaries as JSON; detailed SQL analysis can use the tables above. This schema has no migration mechanism yet.
+
+## Exploratory parameter comparison
+
+Run a fixed nine-variant comparison against one live session without touching its
+writer database, sending notifications, or modifying the live settings:
+
+```sh
+uv run python -m beta_lag.research data/live/SESSION --output data/research/comparison.json
+```
+
+The original effective configuration comes from that session's manifest. The
+comparison reads only the journal bytes present at startup and ignores an
+incomplete last line. Other malformed events are errors. Output is created
+exclusively and refuses overwrite. Each variant preserves fees, slippage,
+session gating, stop/target rules and next-observation fills.
+
+The grid combines 15/30/60-minute holding limits with three warning modes:
+
+- Original rules.
+- Require 15 seconds of continuously observed equity stress and BTC divergence
+  before WARNING. Missing/stale data, closed sessions or broken conditions reset
+  the candidate. Gaps between observations are not proof of continuous prices.
+- Enter below the original equity threshold, but cancel only after recovery to
+  80% of that negative threshold (defaults: enter below -1%, recover to -0.8%).
+  All other cancellation conditions remain active.
+
+These experimental options are passed only to the offline engine. They are not
+live TOML settings. The original 30-minute variant is the control. Compare signal
+counts, open/pending trades, data gaps and exit reasons as well as mean net return.
+Longer positions can suppress later entries. MFE/MAE continue after a trade closes;
+they are not achievable trade profits or an alternative fill simulation.
+
+This is exploratory analysis on the same collected sample, with no automatic
+winner selection. Freeze any proposed change before evaluating new, unseen data;
+do not use this report as out-of-sample evidence or infer reliability from a
+handful of trades.
+
+## Findings from the 2026-11-18 snapshot
+
+Source: run `20261110T051315Z-b995dd71`, 296,901 events through
+2026-11-18 17:15:37 UTC (18:15:37 Swiss time). Full local artifact:
+`data/research/comparison-20261118.json` (generated locally; research data are not versioned).
+The live strategy retains its original settings.
+
+| Warning mode | Holding limit | Closed trades | Winners | Mean net return per trade |
+| --- | --- | --- | --- | --- |
+| Original | 15 min | 2 | 1 | -0.005% |
+| 15-second persistence | 15 min | 1 | 0 | -0.367% |
+| Release at -0.8% | 15 min | 3 | 2 | +0.318% |
+| Original | 30 min | 2 | 1 | -0.051% |
+| 15-second persistence | 30 min | 1 | 0 | -0.646% |
+| Release at -0.8% | 30 min | 3 | 2 | +0.288% |
+| Original | 60 min | 2 | 1 | +0.139% |
+| 15-second persistence | 60 min | 1 | 0 | -0.646% |
+| Release at -0.8% | 60 min | 3 | 2 | +0.414% |
+
+Returns include the configured fee/slippage assumptions and exclude funding.
+These are arithmetic per-trade means, not portfolio returns. Every variant had
+zero open trades at this snapshot. One to three trades per variant are far too
+few to establish an advantage, and all variants use the same observed sample.
+
+The original 30-minute control reproduces the actual two paper trades:
+
+- 2026-11-10: stop-loss, -0.646% net.
+- 2026-11-18: time exit, +0.544% net.
+
+The original rules produced 12 warnings, three armings and two confirmations.
+Ten cancellations were due to equity stress recovery (seven) or BTC divergence
+ending before arming (three). Across 13 metrics checks during WARNING, OI rank
+failed ten times and rising OI failed four times. Counts overlap; they are not
+counts of distinct cancelled setups. The long-share filter never failed at
+those checks.
+
+Observed persistence reduced warnings but excluded the later winning trade,
+retaining the first loss. The relaxed equity release threshold admitted an extra
+winning trade on November 16 in this sample. A 60-minute hold let the November 18
+trade hit its target, but did not rescue the earlier stopped trade. These are
+hypotheses to test on future data, not reasons to deploy the best-looking row.
+No live holding time, stop, target, warning threshold or data source was changed.
